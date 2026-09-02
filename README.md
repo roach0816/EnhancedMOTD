@@ -38,6 +38,8 @@ Required packages are normally present on a standard Debian installation:
 
 The installer checks these requirements and reports the package installation command if anything is missing.
 
+Repository update checks additionally require either `curl` or `wget`.
+
 ## Quick start with Git
 
 Install Git if necessary, clone the repository, preview the MOTD, and then install it:
@@ -84,6 +86,8 @@ After installation, `motdctl` is available system-wide:
 | --- | --- |
 | `motdctl preview` | Render the MOTD immediately |
 | `sudo motdctl refresh` | Refresh APT metadata and cached update counts |
+| `motdctl check-update` | Check the repository for a newer version |
+| `sudo motdctl update` | Review and install a newer version |
 | `motdctl status` | Show the installed version, timer, and cache status |
 | `sudo motdctl configure` | Edit the configuration and render a preview |
 | `motdctl version` | Show the installed version and project URL |
@@ -127,6 +131,8 @@ The configuration includes:
 | `SHOW_DOWN_INTERFACES` | `1` | Include relevant interfaces whose link is down |
 | `SHOW_VIRTUAL_INTERFACES` | `0` | Include common virtual network interfaces |
 | `SHOW_PROCESS_COUNT` | `1` | Display the current process count |
+| `CHECK_FOR_UPDATES` | `1` | Check GitHub daily and cache the result |
+| `AUTO_UPDATE` | `0` | Automatically install a newer version as root |
 
 Configuration values are sanitized at render time. A value outside its supported range falls back to the default.
 
@@ -142,6 +148,8 @@ The installer creates or manages the following paths:
 | `/etc/update-motd.d/00-homelab-motd` | Dynamic MOTD entry point |
 | `/etc/systemd/system/homelab-motd-refresh.service` | APT cache refresh service |
 | `/etc/systemd/system/homelab-motd-refresh.timer` | Six-hour refresh schedule with randomized delay |
+| `/etc/systemd/system/homelab-motd-update.service` | Repository update checker/installer |
+| `/etc/systemd/system/homelab-motd-update.timer` | Daily update-check schedule with randomized delay |
 | `/var/cache/homelab-motd` | Cached package update information |
 | `/var/lib/homelab-motd` | Version and restoration state |
 
@@ -150,6 +158,47 @@ During the first installation, the current `/etc/motd` is saved and replaced wit
 The initial installation runs `apt-get update` through the refresh service. The systemd timer repeats the refresh at approximately 00:00, 06:00, 12:00, and 18:00, with up to 15 minutes of randomized delay.
 
 ## Upgrade
+
+EnhancedMOTD checks the repository once per day without delaying SSH login. The result is stored locally; when a newer version is available, the maintenance section tells the user to run:
+
+```bash
+sudo motdctl update
+```
+
+The command downloads `VERSION` and the installer over HTTPS, verifies that both versions match, validates the installer with `bash -n`, asks for confirmation, and then performs the same in-place installation used for normal upgrades. Existing configuration and restoration state are preserved.
+
+To check without installing:
+
+```bash
+motdctl check-update
+```
+
+### Automatic updates
+
+Automatic installation is deliberately disabled by default. To opt in, edit the configuration:
+
+```bash
+sudo motdctl configure
+```
+
+Set:
+
+```bash
+CHECK_FOR_UPDATES=1
+AUTO_UPDATE=1
+```
+
+The next daily timer run will install a newer version without prompting. To run the scheduled workflow immediately:
+
+```bash
+sudo systemctl start homelab-motd-update.service
+```
+
+To prevent all repository checks, set both values to `0`. The timer remains installed but exits without network access.
+
+Automatic updates execute repository code as root. The version and syntax checks protect against incomplete or inconsistent publishing, but they are not a cryptographic signature. Leave `AUTO_UPDATE=0` if you prefer to review each change before installation.
+
+### Manual Git upgrade
 
 If you installed from a Git clone:
 
@@ -162,6 +211,17 @@ sudo bash homelab-motd-installer.sh --install
 Running `--install` again replaces the managed runtime and systemd units but preserves `/etc/default/homelab-motd`.
 
 If you downloaded the script directly, download a fresh copy and run the same `--install` command.
+
+### Publishing a new version
+
+The updater follows the repository's `main` branch. Before publishing an update:
+
+1. Change `INSTALLER_VERSION` and the embedded `MOTD_VERSION` in `homelab-motd-installer.sh`.
+2. Put the same semantic version in `VERSION`.
+3. Run `bash homelab-motd-installer.sh --self-test`.
+4. Commit and push the installer, README, and `VERSION` together.
+
+Clients will not advertise a code change until `VERSION` is increased. The updater refuses installation if `VERSION` and the downloaded installer's version do not match.
 
 ## Uninstall
 
@@ -177,7 +237,7 @@ You can also uninstall with a downloaded copy of the installer:
 sudo bash homelab-motd-installer.sh --uninstall
 ```
 
-Uninstall removes EnhancedMOTD's runtime, timer, service, configuration, and cache. It restores the original `/etc/motd`, fragment permissions, and any recognized legacy MOTD timer state saved during installation. If `/etc/motd` was changed after installation, that content is preserved in a timestamped backup before the original is restored.
+Uninstall removes EnhancedMOTD's runtime, timers, services, configuration, and caches. It restores the original `/etc/motd`, fragment permissions, and any recognized legacy MOTD timer state saved during installation. If `/etc/motd` was changed after installation, that content is preserved in a timestamped backup before the original is restored.
 
 ## Troubleshooting
 
@@ -215,4 +275,4 @@ Installation and uninstall changes should also be tested on a disposable Debian-
 
 ## License
 
-This repository does not currently include a license. A public GitHub repository is visible to others, but it does not grant reuse or redistribution rights by itself. Add a `LICENSE` file before inviting third-party reuse or contributions.
+EnhancedMOTD is available under the [MIT License](LICENSE).

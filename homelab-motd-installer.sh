@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.0.4"
+readonly INSTALLER_VERSION="1.1.0"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
@@ -12,6 +12,8 @@ readonly CONFIG_PATH="/etc/default/homelab-motd"
 readonly FRAGMENT_PATH="/etc/update-motd.d/00-homelab-motd"
 readonly SERVICE_PATH="/etc/systemd/system/homelab-motd-refresh.service"
 readonly TIMER_PATH="/etc/systemd/system/homelab-motd-refresh.timer"
+readonly UPDATE_SERVICE_PATH="/etc/systemd/system/homelab-motd-update.service"
+readonly UPDATE_TIMER_PATH="/etc/systemd/system/homelab-motd-update.timer"
 readonly STATE_DIR="/var/lib/homelab-motd"
 readonly CACHE_DIR="/var/cache/homelab-motd"
 
@@ -71,11 +73,14 @@ write_runtime() {
 
 set -uo pipefail
 
-readonly MOTD_VERSION="1.0.4"
+readonly MOTD_VERSION="1.1.0"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
+readonly VERSION_URL="https://raw.githubusercontent.com/roach0816/EnhancedMOTD/main/VERSION"
+readonly INSTALLER_URL="https://raw.githubusercontent.com/roach0816/EnhancedMOTD/main/homelab-motd-installer.sh"
 readonly CONFIG_FILE="/etc/default/homelab-motd"
 readonly CACHE_DIR="/var/cache/homelab-motd"
 readonly CACHE_FILE="${CACHE_DIR}/apt-cache"
+readonly RELEASE_CACHE_FILE="${CACHE_DIR}/release-cache"
 readonly STATE_DIR="/var/lib/homelab-motd"
 readonly DISABLED_FILE="${STATE_DIR}/disabled-fragments.tsv"
 readonly DISABLED_SYMLINKS_FILE="${STATE_DIR}/disabled-symlinks.tsv"
@@ -84,6 +89,8 @@ readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
 readonly SERVICE_PATH="/etc/systemd/system/homelab-motd-refresh.service"
 readonly TIMER_PATH="/etc/systemd/system/homelab-motd-refresh.timer"
+readonly UPDATE_SERVICE_PATH="/etc/systemd/system/homelab-motd-update.service"
+readonly UPDATE_TIMER_PATH="/etc/systemd/system/homelab-motd-update.timer"
 
 # Defaults are intentionally useful even if an older configuration lacks a setting.
 COLOR="auto"
@@ -101,6 +108,8 @@ REBOOT_REQUIRED_IS_WARNING=1
 SHOW_DOWN_INTERFACES=1
 SHOW_VIRTUAL_INTERFACES=0
 SHOW_PROCESS_COUNT=1
+CHECK_FOR_UPDATES=1
+AUTO_UPDATE=0
 
 load_config() {
   if [[ -r "$CONFIG_FILE" ]]; then
@@ -122,6 +131,8 @@ load_config() {
   sanitize_integer SHOW_DOWN_INTERFACES 1 0 1
   sanitize_integer SHOW_VIRTUAL_INTERFACES 0 0 1
   sanitize_integer SHOW_PROCESS_COUNT 1 0 1
+  sanitize_integer CHECK_FOR_UPDATES 1 0 1
+  sanitize_integer AUTO_UPDATE 0 0 1
 }
 
 sanitize_integer() {
@@ -366,6 +377,22 @@ read_package_cache() {
   done <"$CACHE_FILE"
 }
 
+read_release_cache() {
+  LATEST_MOTD_VERSION=""
+  MOTD_UPDATE_AVAILABLE=0
+  RELEASE_CHECK_EPOCH=0
+  RELEASE_CHECK_STATUS="missing"
+  [[ -r "$RELEASE_CACHE_FILE" ]] || return 0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      LATEST_VERSION) [[ "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && LATEST_MOTD_VERSION=$value ;;
+      UPDATE_AVAILABLE) [[ "$value" =~ ^[01]$ ]] && MOTD_UPDATE_AVAILABLE=$value ;;
+      CHECKED_EPOCH) [[ "$value" =~ ^[0-9]+$ ]] && RELEASE_CHECK_EPOCH=$value ;;
+      CHECK_STATUS) [[ "$value" =~ ^(ok|error)$ ]] && RELEASE_CHECK_STATUS=$value ;;
+    esac
+  done <"$RELEASE_CACHE_FILE"
+}
+
 is_virtual_interface() {
   local name=$1
   [[ "$name" =~ ^(lo|docker[0-9]*|br-|veth|cni|flannel|kube|virbr|lxc|lxd|tun|tap|wg|tailscale|zt) ]]
@@ -489,6 +516,7 @@ collect_system_data() {
   REBOOT_REQUIRED=0
   [[ -e /run/reboot-required || -e /var/run/reboot-required ]] && REBOOT_REQUIRED=1
   read_package_cache
+  read_release_cache
   discover_interfaces
   DEFAULT_ROUTE=$(default_route)
 }
@@ -626,6 +654,9 @@ render_compact() {
     refresh_text="Package information has not been refreshed"
   fi
   box_line "$MUTED$refresh_text$RESET"
+  if (( MOTD_UPDATE_AVAILABLE )) && [[ -n "$LATEST_MOTD_VERSION" ]]; then
+    box_line "${YELLOW}Homelab MOTD $LATEST_MOTD_VERSION available${SEP}sudo motdctl update${RESET}"
+  fi
   box_bottom
 }
 
@@ -639,6 +670,9 @@ render_narrow() {
     printf '%s: %s\n' "$(interface_alias "$iface")" "$(interface_ipv4 "$iface")"
   done
   ((${#ALERTS[@]} == 0)) || printf 'ATTENTION: %s\n' "$(strip_ansi "${ALERTS[0]}")"
+  if (( MOTD_UPDATE_AVAILABLE )) && [[ -n "$LATEST_MOTD_VERSION" ]]; then
+    printf 'UPDATE: Homelab MOTD %s available; run sudo motdctl update\n' "$LATEST_MOTD_VERSION"
+  fi
 }
 
 render() {
@@ -696,17 +730,157 @@ refresh_packages() {
   return 0
 }
 
+fetch_url() {
+  local url=$1 destination=$2
+  if command -v curl >/dev/null 2>&1; then
+    curl --fail --silent --show-error --location \
+      --connect-timeout 10 --max-time 60 --output "$destination" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget --quiet --timeout=60 --output-document="$destination" "$url"
+  else
+    printf 'Update checks require curl or wget.\n' >&2
+    return 127
+  fi
+}
+
+write_release_cache() {
+  (( EUID == 0 )) || return 0
+  [[ "${HOMELAB_MOTD_NO_CACHE:-0}" != 1 ]] || return 0
+  local status=$1 latest=${2:-} available=${3:-0} temp
+  install -d -m 0755 "$CACHE_DIR"
+  temp=$(mktemp "${CACHE_DIR}/.release-cache.XXXXXX")
+  {
+    printf 'CHECKED_EPOCH=%s\n' "$(date +%s)"
+    printf 'CHECK_STATUS=%s\n' "$status"
+    [[ -n "$latest" ]] && printf 'LATEST_VERSION=%s\n' "$latest"
+    printf 'UPDATE_AVAILABLE=%s\n' "$available"
+  } >"$temp"
+  chmod 0644 "$temp"
+  mv -f "$temp" "$RELEASE_CACHE_FILE"
+}
+
+version_is_newer() {
+  local candidate=$1 current=$2 highest
+  highest=$(printf '%s\n%s\n' "$candidate" "$current" | LC_ALL=C sort -V | tail -n1)
+  [[ "$candidate" != "$current" && "$highest" == "$candidate" ]]
+}
+
+check_project_update() {
+  local quiet=${1:-} temp latest
+  LATEST_REMOTE_VERSION=""
+  PROJECT_UPDATE_AVAILABLE=0
+  temp=$(mktemp)
+  if ! fetch_url "$VERSION_URL" "$temp"; then
+    rm -f "$temp"
+    write_release_cache error "" 0
+    [[ "$quiet" == --quiet ]] || printf 'Could not check %s for updates.\n' "$PROJECT_URL" >&2
+    return 1
+  fi
+  latest=$(tr -d '[:space:]' <"$temp")
+  rm -f "$temp"
+  if [[ ! "$latest" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    write_release_cache error "" 0
+    printf 'The repository returned an invalid version: %s\n' "$latest" >&2
+    return 1
+  fi
+
+  LATEST_REMOTE_VERSION=$latest
+  if version_is_newer "$latest" "$MOTD_VERSION"; then
+    PROJECT_UPDATE_AVAILABLE=1
+  fi
+  write_release_cache ok "$latest" "$PROJECT_UPDATE_AVAILABLE"
+
+  if [[ "$quiet" != --quiet ]]; then
+    if (( PROJECT_UPDATE_AVAILABLE )); then
+      printf 'Homelab MOTD %s is available (installed: %s).\n' "$latest" "$MOTD_VERSION"
+      printf 'Run "sudo motdctl update" to review and install it.\n'
+    else
+      printf 'Homelab MOTD %s is up to date.\n' "$MOTD_VERSION"
+    fi
+  fi
+}
+
+update_project() {
+  (( EUID == 0 )) || { printf 'Run "sudo motdctl update".\n' >&2; return 1; }
+  local assume_yes=${1:-} temp_dir installer downloaded_version answer result
+  if ! check_project_update --quiet; then
+    return 1
+  fi
+  if (( ! PROJECT_UPDATE_AVAILABLE )); then
+    printf 'Homelab MOTD %s is already up to date.\n' "$MOTD_VERSION"
+    return 0
+  fi
+
+  temp_dir=$(mktemp -d)
+  installer="$temp_dir/homelab-motd-installer.sh"
+  if ! fetch_url "$INSTALLER_URL" "$installer"; then
+    rm -rf -- "$temp_dir"
+    return 1
+  fi
+  if ! bash -n "$installer"; then
+    printf 'Downloaded installer failed Bash syntax validation.\n' >&2
+    rm -rf -- "$temp_dir"
+    return 1
+  fi
+  downloaded_version=$(awk -F'"' '$1=="readonly INSTALLER_VERSION=" {print $2; exit}' "$installer")
+  if [[ "$downloaded_version" != "$LATEST_REMOTE_VERSION" ]]; then
+    printf 'Version mismatch: VERSION says %s but the installer says %s. Update aborted.\n' \
+      "$LATEST_REMOTE_VERSION" "${downloaded_version:-unknown}" >&2
+    rm -rf -- "$temp_dir"
+    return 1
+  fi
+
+  if [[ "$assume_yes" != --yes && "$assume_yes" != -y ]]; then
+    if [[ ! -t 0 ]]; then
+      printf 'Interactive confirmation is unavailable; rerun with "sudo motdctl update --yes".\n' >&2
+      rm -rf -- "$temp_dir"
+      return 2
+    fi
+    printf 'Install Homelab MOTD %s from %s? [y/N] ' "$LATEST_REMOTE_VERSION" "$PROJECT_URL"
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { printf 'Update cancelled.\n'; rm -rf -- "$temp_dir"; return 0; }
+  fi
+
+  printf 'Installing Homelab MOTD %s...\n' "$LATEST_REMOTE_VERSION"
+  bash "$installer" --install
+  result=$?
+  rm -rf -- "$temp_dir"
+  if (( result == 0 )); then
+    "$RUNTIME_PATH" check-update --quiet >/dev/null 2>&1 || true
+  fi
+  return "$result"
+}
+
+scheduled_update() {
+  if (( ! CHECK_FOR_UPDATES && ! AUTO_UPDATE )); then
+    return 0
+  fi
+  if (( AUTO_UPDATE )); then
+    update_project --yes || printf 'Automatic Homelab MOTD update failed; the timer will retry.\n' >&2
+  else
+    check_project_update --quiet || printf 'Homelab MOTD update check failed; the timer will retry.\n' >&2
+  fi
+  return 0
+}
+
 show_status() {
   printf 'Homelab MOTD version: %s\n' "$MOTD_VERSION"
   printf 'Configuration: %s\n' "$CONFIG_FILE"
   printf 'Package cache: %s\n' "$CACHE_FILE"
+  printf 'Update checks: %s\n' "$([[ "$CHECK_FOR_UPDATES" == 1 ]] && printf enabled || printf disabled)"
+  printf 'Automatic installation: %s\n' "$([[ "$AUTO_UPDATE" == 1 ]] && printf enabled || printf disabled)"
   if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
     printf 'Refresh timer: %s\n' "$(systemctl is-active homelab-motd-refresh.timer 2>/dev/null || true)"
-    systemctl list-timers homelab-motd-refresh.timer --no-pager 2>/dev/null || true
+    printf 'Update timer: %s\n' "$(systemctl is-active homelab-motd-update.timer 2>/dev/null || true)"
+    systemctl list-timers homelab-motd-refresh.timer homelab-motd-update.timer --no-pager 2>/dev/null || true
   fi
   if [[ -r "$CACHE_FILE" ]]; then
     printf '\nCached package information:\n'
     sed 's/^/  /' "$CACHE_FILE"
+  fi
+  if [[ -r "$RELEASE_CACHE_FILE" ]]; then
+    printf '\nCached release information:\n'
+    sed 's/^/  /' "$RELEASE_CACHE_FILE"
   fi
 }
 
@@ -805,7 +979,9 @@ uninstall_motd() {
   (( EUID == 0 )) || { printf 'Run "sudo motdctl uninstall".\n' >&2; return 1; }
   printf 'Removing Homelab MOTD...\n'
   systemctl disable --now homelab-motd-refresh.timer >/dev/null 2>&1 || true
-  rm -f "$TIMER_PATH" "$SERVICE_PATH" "$MOTD_FRAGMENT" "$CONTROL_PATH"
+  systemctl disable --now homelab-motd-update.timer >/dev/null 2>&1 || true
+  rm -f "$TIMER_PATH" "$SERVICE_PATH" "$UPDATE_TIMER_PATH" "$UPDATE_SERVICE_PATH" \
+    "$MOTD_FRAGMENT" "$CONTROL_PATH"
   restore_fragment_symlinks
   restore_fragments
   restore_prior_motd
@@ -823,16 +999,21 @@ command=${1:-render}
 case "$command" in
   render|preview) render ;;
   refresh) refresh_packages ;;
+  check-update) check_project_update "${2:-}" ;;
+  update) update_project "${2:-}" ;;
+  scheduled-update) scheduled_update ;;
   status) show_status ;;
   configure) configure ;;
   uninstall) uninstall_motd ;;
   version|--version|-V) printf 'Homelab MOTD %s\n%s\n' "$MOTD_VERSION" "$PROJECT_URL" ;;
   --help|-h|help)
     cat <<'EOF'
-Usage: motdctl {preview|refresh|status|configure|uninstall|version}
+Usage: motdctl {preview|refresh|check-update|update|status|configure|uninstall|version}
 
   preview      Render the current MOTD
   refresh      Refresh cached APT update information (requires sudo)
+  check-update Check GitHub for a newer Homelab MOTD release
+  update       Download, validate, and install an update (requires sudo)
   status       Show timer and cache status
   configure    Edit configuration and preview the result (requires sudo)
   uninstall    Remove Homelab MOTD and restore prior files (requires sudo)
@@ -876,8 +1057,31 @@ SHOW_DOWN_INTERFACES=1
 SHOW_VIRTUAL_INTERFACES=0
 
 SHOW_PROCESS_COUNT=1
+
+# Check GitHub daily and cache whether a newer version is available.
+CHECK_FOR_UPDATES=1
+
+# Automatically install newer versions. Disabled by default because updates run
+# repository code as root. Manual updates use: sudo motdctl update
+AUTO_UPDATE=0
 CONFIG_EOF
   chmod 0644 "$destination"
+}
+
+add_update_config_defaults() {
+  local destination=$1
+  if grep -Eq '^[[:space:]]*(CHECK_FOR_UPDATES|AUTO_UPDATE)=' "$destination"; then
+    grep -Eq '^[[:space:]]*CHECK_FOR_UPDATES=' "$destination" && \
+      grep -Eq '^[[:space:]]*AUTO_UPDATE=' "$destination" && return 0
+  fi
+  {
+    printf '\n# EnhancedMOTD repository update settings\n'
+    grep -Eq '^[[:space:]]*CHECK_FOR_UPDATES=' "$destination" || printf 'CHECK_FOR_UPDATES=1\n'
+    if ! grep -Eq '^[[:space:]]*AUTO_UPDATE=' "$destination"; then
+      printf '# Automatic installation runs downloaded repository code as root.\n'
+      printf 'AUTO_UPDATE=0\n'
+    fi
+  } >>"$destination"
 }
 
 write_fragment() {
@@ -929,6 +1133,45 @@ AccuracySec=1min
 [Install]
 WantedBy=timers.target
 TIMER_EOF
+  chmod 0644 "$destination"
+}
+
+write_update_service() {
+  local destination=$1
+  cat >"$destination" <<'UPDATE_SERVICE_EOF'
+[Unit]
+Description=Check for Homelab MOTD updates
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/homelab-motd scheduled-update
+Nice=10
+IOSchedulingClass=idle
+PrivateTmp=true
+ProtectHome=true
+NoNewPrivileges=true
+TimeoutStartSec=30min
+UPDATE_SERVICE_EOF
+  chmod 0644 "$destination"
+}
+
+write_update_timer() {
+  local destination=$1
+  cat >"$destination" <<'UPDATE_TIMER_EOF'
+[Unit]
+Description=Check for Homelab MOTD updates daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+AccuracySec=15min
+
+[Install]
+WantedBy=timers.target
+UPDATE_TIMER_EOF
   chmod 0644 "$destination"
 }
 
@@ -1094,12 +1337,16 @@ install_motd() {
   write_fragment "$temp_dir/00-homelab-motd"
   write_service "$temp_dir/homelab-motd-refresh.service"
   write_timer "$temp_dir/homelab-motd-refresh.timer"
+  write_update_service "$temp_dir/homelab-motd-update.service"
+  write_update_timer "$temp_dir/homelab-motd-update.timer"
 
   install -o root -g root -m 0755 "$temp_dir/homelab-motd" "$RUNTIME_PATH"
   ln -sfn "$RUNTIME_PATH" "$CONTROL_PATH"
   install -o root -g root -m 0755 "$temp_dir/00-homelab-motd" "$FRAGMENT_PATH"
   install -o root -g root -m 0644 "$temp_dir/homelab-motd-refresh.service" "$SERVICE_PATH"
   install -o root -g root -m 0644 "$temp_dir/homelab-motd-refresh.timer" "$TIMER_PATH"
+  install -o root -g root -m 0644 "$temp_dir/homelab-motd-update.service" "$UPDATE_SERVICE_PATH"
+  install -o root -g root -m 0644 "$temp_dir/homelab-motd-update.timer" "$UPDATE_TIMER_PATH"
 
   if [[ ! -e "$CONFIG_PATH" ]]; then
     write_config "$temp_dir/homelab-motd.conf"
@@ -1107,6 +1354,8 @@ install_motd() {
   else
     ok "Preserved existing configuration at $CONFIG_PATH"
   fi
+  add_update_config_defaults "$CONFIG_PATH"
+  rm -f "$CACHE_DIR/release-cache"
   printf '%s\n' "$INSTALLER_VERSION" >"$STATE_DIR/version"
 
   bash -n "$RUNTIME_PATH" || die "Installed renderer failed syntax validation."
@@ -1115,10 +1364,12 @@ install_motd() {
     die "run-parts validation failed: $run_parts_output"
   fi
   grep -Fxq "$FRAGMENT_PATH" <<<"$run_parts_output" || die "PAM MOTD fragment was not selected by run-parts."
-  systemd-analyze verify "$SERVICE_PATH" "$TIMER_PATH" >/dev/null 2>&1 || die "systemd unit validation failed."
+  systemd-analyze verify "$SERVICE_PATH" "$TIMER_PATH" "$UPDATE_SERVICE_PATH" \
+    "$UPDATE_TIMER_PATH" >/dev/null 2>&1 || die "systemd unit validation failed."
 
   systemctl daemon-reload
   systemctl enable --now homelab-motd-refresh.timer >/dev/null
+  systemctl enable --now homelab-motd-update.timer >/dev/null
   "$RUNTIME_PATH" refresh || warn "Initial package refresh did not complete; the timer will retry."
 
   ok "Installed and enabled Homelab MOTD."
@@ -1128,6 +1379,8 @@ install_motd() {
   printf '  motdctl preview\n'
   printf '  sudo motdctl refresh\n'
   printf '  motdctl status\n'
+  printf '  motdctl check-update\n'
+  printf '  sudo motdctl update\n'
   printf '  sudo motdctl configure\n'
   printf '  sudo motdctl uninstall\n'
 }
@@ -1141,7 +1394,7 @@ preview_uninstalled() {
 }
 
 self_test() {
-  local temp_dir output plain_output service_test line line_length
+  local temp_dir output plain_output update_output service_test update_service_test line line_length
   temp_dir=$(mktemp -d)
   trap "rm -rf -- '$temp_dir'" EXIT
   write_runtime "$temp_dir/homelab-motd"
@@ -1149,17 +1402,52 @@ self_test() {
   write_fragment "$temp_dir/00-homelab-motd"
   write_service "$temp_dir/homelab-motd-refresh.service"
   write_timer "$temp_dir/homelab-motd-refresh.timer"
+  write_update_service "$temp_dir/homelab-motd-update.service"
+  write_update_timer "$temp_dir/homelab-motd-update.timer"
 
   bash -n "$temp_dir/homelab-motd"
   bash -n "$temp_dir/homelab-motd.conf"
+  grep -Fq "readonly MOTD_VERSION=\"$INSTALLER_VERSION\"" "$temp_dir/homelab-motd"
+  grep -Fq 'CHECK_FOR_UPDATES=1' "$temp_dir/homelab-motd.conf"
+  grep -Fq 'AUTO_UPDATE=0' "$temp_dir/homelab-motd.conf"
   grep -Fq 'export HOMELAB_MOTD_LOGIN=1' "$temp_dir/00-homelab-motd"
   grep -Fq 'export LC_CTYPE=C.UTF-8' "$temp_dir/00-homelab-motd"
   grep -Fq 'exec /usr/local/libexec/homelab-motd render' "$temp_dir/00-homelab-motd"
 
+  if (( BASH_VERSINFO[0] >= 4 )); then
+    install -d -m 0755 "$temp_dir/fake-bin"
+    cat >"$temp_dir/fake-bin/curl" <<'FAKE_CURL_EOF'
+#!/bin/sh
+destination=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    shift
+    destination=$1
+  fi
+  shift
+done
+[ -n "$destination" ] || exit 2
+printf '9.9.9\n' >"$destination"
+FAKE_CURL_EOF
+    chmod 0755 "$temp_dir/fake-bin/curl"
+    update_output=$(HOMELAB_MOTD_NO_CACHE=1 PATH="$temp_dir/fake-bin:/usr/bin:/bin" \
+      "$BASH" "$temp_dir/homelab-motd" check-update)
+    grep -Fq 'Homelab MOTD 9.9.9 is available' <<<"$update_output"
+  else
+    warn "Updater behavior test skipped because this host has Bash ${BASH_VERSION}; Bash 4+ is required."
+  fi
+
+  if [[ -r VERSION ]]; then
+    [[ "$(tr -d '[:space:]' <VERSION)" == "$INSTALLER_VERSION" ]] || die "VERSION does not match the installer."
+  fi
+
   if command -v systemd-analyze >/dev/null 2>&1; then
     service_test="$temp_dir/homelab-motd-refresh.service"
+    update_service_test="$temp_dir/homelab-motd-update.service"
     sed -i "s|ExecStart=/usr/local/libexec/homelab-motd refresh|ExecStart=$temp_dir/homelab-motd refresh|" "$service_test"
-    systemd-analyze verify "$service_test" "$temp_dir/homelab-motd-refresh.timer" >/dev/null
+    sed -i "s|ExecStart=/usr/local/libexec/homelab-motd scheduled-update|ExecStart=$temp_dir/homelab-motd scheduled-update|" "$update_service_test"
+    systemd-analyze verify "$service_test" "$temp_dir/homelab-motd-refresh.timer" \
+      "$update_service_test" "$temp_dir/homelab-motd-update.timer" >/dev/null
   fi
 
   if [[ "$(uname -s)" == Linux && -r /proc/loadavg && -r /proc/meminfo ]]; then
