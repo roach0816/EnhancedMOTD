@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.0.3"
+readonly INSTALLER_VERSION="1.0.4"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
@@ -71,7 +71,7 @@ write_runtime() {
 
 set -uo pipefail
 
-readonly MOTD_VERSION="1.0.3"
+readonly MOTD_VERSION="1.0.4"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly CONFIG_FILE="/etc/default/homelab-motd"
 readonly CACHE_DIR="/var/cache/homelab-motd"
@@ -1029,11 +1029,21 @@ should_disable_fragment() {
 }
 
 disable_competing_fragments() {
-  local path mode target already_recorded
+  local path mode target recorded_path recorded_target already_recorded
   install -d -m 0755 /etc/update-motd.d
   touch "$STATE_DIR/disabled-fragments.tsv"
   touch "$STATE_DIR/disabled-symlinks.tsv"
   chmod 0600 "$STATE_DIR/disabled-fragments.tsv" "$STATE_DIR/disabled-symlinks.tsv"
+
+  # Version 1.0.3 used /dev/null symlinks, which run-parts rejects as invalid.
+  # Remove those managed placeholders; the original targets remain recorded.
+  while IFS=$'\t' read -r recorded_path recorded_target; do
+    [[ "$recorded_path" == /etc/update-motd.d/* && -n "$recorded_target" ]] || continue
+    if [[ -L "$recorded_path" && "$(readlink "$recorded_path")" == /dev/null ]]; then
+      rm -f "$recorded_path"
+    fi
+  done <"$STATE_DIR/disabled-symlinks.tsv"
+
   for path in /etc/update-motd.d/*; do
     [[ -f "$path" && -x "$path" ]] || continue
     should_disable_fragment "$path" || continue
@@ -1046,7 +1056,6 @@ disable_competing_fragments() {
         printf '%s\t%s\n' "$path" "$target" >>"$STATE_DIR/disabled-symlinks.tsv"
       fi
       rm -f "$path"
-      ln -s /dev/null "$path"
       continue
     fi
 
@@ -1064,7 +1073,7 @@ install_motd() {
   require_root
   check_install_requirements
 
-  local platform temp_dir first_install=0
+  local platform temp_dir run_parts_output first_install=0
   platform=$(detect_platform)
   info "Installing Homelab MOTD $INSTALLER_VERSION on $platform"
 
@@ -1102,7 +1111,10 @@ install_motd() {
 
   bash -n "$RUNTIME_PATH" || die "Installed renderer failed syntax validation."
   bash -n "$CONFIG_PATH" || die "Configuration failed syntax validation: $CONFIG_PATH"
-  run-parts --test /etc/update-motd.d | grep -Fxq "$FRAGMENT_PATH" || die "PAM MOTD fragment is not executable."
+  if ! run_parts_output=$(run-parts --test /etc/update-motd.d 2>&1); then
+    die "run-parts validation failed: $run_parts_output"
+  fi
+  grep -Fxq "$FRAGMENT_PATH" <<<"$run_parts_output" || die "PAM MOTD fragment was not selected by run-parts."
   systemd-analyze verify "$SERVICE_PATH" "$TIMER_PATH" >/dev/null 2>&1 || die "systemd unit validation failed."
 
   systemctl daemon-reload

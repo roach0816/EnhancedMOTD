@@ -192,7 +192,7 @@ systemctl status homelab-motd-refresh.service
 
 If the MOTD previews correctly but does not appear during SSH login, confirm that SSH uses PAM and that the host's PAM configuration invokes `pam_motd`/`/etc/update-motd.d`. Debian-family systems normally configure this by default.
 
-If a preview has color but an SSH login does not, Unicode rows do not align at the right edge, or Ubuntu's standard system-information block appears below the dashboard, upgrade to version 1.0.3 or newer and rerun the installer. Earlier versions could misinterpret PAM's cleaned login environment or miss locally generated Ubuntu fragments. As an administrator-controlled fallback for color, you can also set `COLOR="always"` in `/etc/default/homelab-motd`; explicit `never` settings continue to disable color and Unicode.
+If a preview has color but an SSH login does not, Unicode rows do not align at the right edge, Ubuntu's standard system-information block appears below the dashboard, or `run-parts` rejects `50-landscape-sysinfo`, upgrade to version 1.0.4 or newer and rerun the installer. Earlier versions could misinterpret PAM's cleaned login environment or mishandle locally generated Ubuntu fragments. As an administrator-controlled fallback for color, you can also set `COLOR="always"` in `/etc/default/homelab-motd`; explicit `never` settings continue to disable color and Unicode.
 
 To verify that the fragment is selected by `run-parts`:
 
