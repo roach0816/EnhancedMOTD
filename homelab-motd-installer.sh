@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.0.1"
+readonly INSTALLER_VERSION="1.0.2"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
@@ -71,7 +71,7 @@ write_runtime() {
 
 set -uo pipefail
 
-readonly MOTD_VERSION="1.0.1"
+readonly MOTD_VERSION="1.0.2"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly CONFIG_FILE="/etc/default/homelab-motd"
 readonly CACHE_DIR="/var/cache/homelab-motd"
@@ -852,6 +852,8 @@ write_fragment() {
 #!/bin/sh
 # pam_motd may not provide TERM or locale variables during early SSH login.
 export HOMELAB_MOTD_LOGIN=1
+# Character-aware padding requires a UTF-8 character type locale.
+export LC_CTYPE=C.UTF-8
 exec /usr/local/libexec/homelab-motd render
 FRAGMENT_EOF
   chmod 0755 "$destination"
@@ -1060,7 +1062,7 @@ preview_uninstalled() {
 }
 
 self_test() {
-  local temp_dir output plain_output service_test
+  local temp_dir output plain_output service_test line line_length
   temp_dir=$(mktemp -d)
   trap "rm -rf -- '$temp_dir'" EXIT
   write_runtime "$temp_dir/homelab-motd"
@@ -1072,6 +1074,7 @@ self_test() {
   bash -n "$temp_dir/homelab-motd"
   bash -n "$temp_dir/homelab-motd.conf"
   grep -Fq 'export HOMELAB_MOTD_LOGIN=1' "$temp_dir/00-homelab-motd"
+  grep -Fq 'export LC_CTYPE=C.UTF-8' "$temp_dir/00-homelab-motd"
   grep -Fq 'exec /usr/local/libexec/homelab-motd render' "$temp_dir/00-homelab-motd"
 
   if command -v systemd-analyze >/dev/null 2>&1; then
@@ -1081,17 +1084,25 @@ self_test() {
   fi
 
   if [[ "$(uname -s)" == Linux && -r /proc/loadavg && -r /proc/meminfo ]]; then
-    output=$(HOMELAB_MOTD_LOGIN=1 TERM=dumb LANG=C COLUMNS=78 "$temp_dir/homelab-motd" preview)
+    output=$(HOMELAB_MOTD_LOGIN=1 TERM=dumb LANG=C LC_CTYPE=C.UTF-8 COLUMNS=78 "$temp_dir/homelab-motd" preview)
     grep -Fq "$(hostname)" <<<"$output"
     grep -Fq 'NETWORK' <<<"$output"
     grep -Fq 'MAINTENANCE' <<<"$output"
     grep -Fq $'\033[' <<<"$output"
     grep -Fq '╭' <<<"$output"
 
-    plain_output=$(HOMELAB_MOTD_LOGIN=1 NO_COLOR=1 TERM=dumb LANG=C COLUMNS=78 "$temp_dir/homelab-motd" preview)
+    plain_output=$(HOMELAB_MOTD_LOGIN=1 NO_COLOR=1 TERM=dumb LANG=C LC_CTYPE=C.UTF-8 COLUMNS=78 "$temp_dir/homelab-motd" preview)
     if grep -Fq $'\033[' <<<"$plain_output"; then
       die "NO_COLOR did not disable color in login mode."
     fi
+    while IFS= read -r line; do
+      case "$line" in
+        ╭*|├*|│*|╰*) ;;
+        *) continue ;;
+      esac
+      line_length=$(printf '%s' "$line" | LC_CTYPE=C.UTF-8 wc -m | tr -d ' ')
+      [[ "$line_length" == 78 ]] || die "Renderer produced a ${line_length}-column box row; expected 78."
+    done <<<"$plain_output"
     ok "Embedded runtime, configuration, systemd units, and renderer passed validation."
   else
     warn "Renderer test skipped because Linux /proc data is unavailable on this host."
