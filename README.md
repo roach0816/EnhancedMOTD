@@ -16,7 +16,7 @@ This is a Git source repository, not a Debian APT repository. Clone it or downlo
 - Cached APT update counts refreshed by a systemd timer
 - Failed systemd unit and reboot-required warnings
 - Repeatable upgrades that preserve the existing configuration
-- Uninstaller that restores the prior MOTD and re-enables disabled fragments
+- Uninstaller that restores the prior MOTD, fragments, and MOTD-related timer state
 
 ## Supported systems
 
@@ -145,7 +145,7 @@ The installer creates or manages the following paths:
 | `/var/cache/homelab-motd` | Cached package update information |
 | `/var/lib/homelab-motd` | Version and restoration state |
 
-During the first installation, the current `/etc/motd` is saved and replaced with an empty static MOTD so that the dashboard is not followed by duplicate text. Executable distribution-provided fragments in `/etc/update-motd.d` are disabled and their modes are recorded. Uninstall restores this saved state.
+During the first installation, the current `/etc/motd` is saved and replaced with an empty static MOTD so that the dashboard is not followed by duplicate text. Every other executable fragment in `/etc/update-motd.d` is disabled; file modes and symlink targets are recorded, including locally generated integrations such as Ubuntu's Landscape system information. On Ubuntu, the now-unused `motd-news.timer` is also disabled and its previous state is recorded. Uninstall restores this saved state.
 
 The initial installation runs `apt-get update` through the refresh service. The systemd timer repeats the refresh at approximately 00:00, 06:00, 12:00, and 18:00, with up to 15 minutes of randomized delay.
 
@@ -192,7 +192,7 @@ systemctl status homelab-motd-refresh.service
 
 If the MOTD previews correctly but does not appear during SSH login, confirm that SSH uses PAM and that the host's PAM configuration invokes `pam_motd`/`/etc/update-motd.d`. Debian-family systems normally configure this by default.
 
-If a preview has color but an SSH login does not, or Unicode rows do not align at the right edge, upgrade to version 1.0.2 or newer and rerun the installer. Earlier versions could treat PAM's cleaned login environment as a non-color terminal or count UTF-8 characters as multiple bytes because `TERM` and locale variables are unavailable when Debian generates the dynamic MOTD. As an administrator-controlled fallback for color, you can also set `COLOR="always"` in `/etc/default/homelab-motd`; explicit `never` settings continue to disable color and Unicode.
+If a preview has color but an SSH login does not, Unicode rows do not align at the right edge, or Ubuntu's standard system-information block appears below the dashboard, upgrade to version 1.0.3 or newer and rerun the installer. Earlier versions could misinterpret PAM's cleaned login environment or miss locally generated Ubuntu fragments. As an administrator-controlled fallback for color, you can also set `COLOR="always"` in `/etc/default/homelab-motd`; explicit `never` settings continue to disable color and Unicode.
 
 To verify that the fragment is selected by `run-parts`:
 

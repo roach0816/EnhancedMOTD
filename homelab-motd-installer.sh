@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-readonly INSTALLER_VERSION="1.0.2"
+readonly INSTALLER_VERSION="1.0.3"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
@@ -71,13 +71,14 @@ write_runtime() {
 
 set -uo pipefail
 
-readonly MOTD_VERSION="1.0.2"
+readonly MOTD_VERSION="1.0.3"
 readonly PROJECT_URL="https://github.com/roach0816/EnhancedMOTD"
 readonly CONFIG_FILE="/etc/default/homelab-motd"
 readonly CACHE_DIR="/var/cache/homelab-motd"
 readonly CACHE_FILE="${CACHE_DIR}/apt-cache"
 readonly STATE_DIR="/var/lib/homelab-motd"
 readonly DISABLED_FILE="${STATE_DIR}/disabled-fragments.tsv"
+readonly DISABLED_SYMLINKS_FILE="${STATE_DIR}/disabled-symlinks.tsv"
 readonly MOTD_FRAGMENT="/etc/update-motd.d/00-homelab-motd"
 readonly RUNTIME_PATH="/usr/local/libexec/homelab-motd"
 readonly CONTROL_PATH="/usr/local/sbin/motdctl"
@@ -752,8 +753,24 @@ restore_fragments() {
   local path mode
   while IFS=$'\t' read -r path mode; do
     [[ "$path" == /etc/update-motd.d/* && "$mode" =~ ^[0-7]{3,4}$ ]] || continue
-    [[ -e "$path" ]] && chmod "$mode" "$path"
+    [[ -e "$path" && ! -L "$path" ]] && chmod "$mode" "$path"
   done <"$DISABLED_FILE"
+}
+
+restore_fragment_symlinks() {
+  [[ -r "$DISABLED_SYMLINKS_FILE" ]] || return 0
+  local path target current_target
+  while IFS=$'\t' read -r path target; do
+    [[ "$path" == /etc/update-motd.d/* && -n "$target" ]] || continue
+    if [[ -L "$path" ]]; then
+      current_target=$(readlink "$path")
+      [[ "$current_target" == /dev/null ]] || continue
+      rm -f "$path"
+    elif [[ -e "$path" ]]; then
+      continue
+    fi
+    ln -s "$target" "$path"
+  done <"$DISABLED_SYMLINKS_FILE"
 }
 
 restore_legacy_timer() {
@@ -769,15 +786,32 @@ restore_legacy_timer() {
   [[ "$active" == active ]] && systemctl start motd-update.timer >/dev/null 2>&1 || true
 }
 
+restore_motd_news_timer() {
+  local enabled="" active="" service_active=""
+  [[ -r "$STATE_DIR/motd-news.state" ]] || return 0
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ENABLED) enabled=$value ;;
+      ACTIVE) active=$value ;;
+      SERVICE_ACTIVE) service_active=$value ;;
+    esac
+  done <"$STATE_DIR/motd-news.state"
+  [[ "$enabled" == enabled ]] && systemctl enable motd-news.timer >/dev/null 2>&1 || true
+  [[ "$active" == active ]] && systemctl start motd-news.timer >/dev/null 2>&1 || true
+  [[ "$service_active" == active ]] && systemctl start motd-news.service >/dev/null 2>&1 || true
+}
+
 uninstall_motd() {
   (( EUID == 0 )) || { printf 'Run "sudo motdctl uninstall".\n' >&2; return 1; }
   printf 'Removing Homelab MOTD...\n'
   systemctl disable --now homelab-motd-refresh.timer >/dev/null 2>&1 || true
   rm -f "$TIMER_PATH" "$SERVICE_PATH" "$MOTD_FRAGMENT" "$CONTROL_PATH"
+  restore_fragment_symlinks
   restore_fragments
   restore_prior_motd
   systemctl daemon-reload >/dev/null 2>&1 || true
   restore_legacy_timer
+  restore_motd_news_timer
   rm -rf "$CACHE_DIR"
   rm -f "$CONFIG_FILE"
   rm -f "$RUNTIME_PATH"
@@ -901,9 +935,9 @@ TIMER_EOF
 detect_platform() {
   [[ -r /etc/os-release ]] || die "Cannot identify this operating system: /etc/os-release is missing."
   local id id_like pretty
-  id=$(awk -F= '$1=="ID" {gsub(/\"/,"",$2); print $2}' /etc/os-release)
-  id_like=$(awk -F= '$1=="ID_LIKE" {gsub(/\"/,"",$2); print $2}' /etc/os-release)
-  pretty=$(awk -F= '$1=="PRETTY_NAME" {sub(/^[^=]*=/,""); gsub(/^\"|\"$/,"",$0); print}' /etc/os-release)
+  id=$(awk -F= '$1=="ID" {gsub(/"/,"",$2); print $2}' /etc/os-release)
+  id_like=$(awk -F= '$1=="ID_LIKE" {gsub(/"/,"",$2); print $2}' /etc/os-release)
+  pretty=$(awk -F= '$1=="PRETTY_NAME" {sub(/^[^=]*=/,""); gsub(/^"|"$/,"",$0); print}' /etc/os-release)
   if [[ "$id" != debian && "$id" != ubuntu && "$id" != raspbian && ! " $id_like " =~ [[:space:]]debian[[:space:]] ]]; then
     die "Unsupported platform: ${pretty:-$id}. This installer requires a Debian-family distribution."
   fi
@@ -966,28 +1000,60 @@ disable_legacy_timer() {
   ok "Disabled the legacy motd-update.timer; its prior state was recorded for uninstall."
 }
 
-should_disable_fragment() {
-  local path=$1 base
-  base=$(basename "$path")
-  [[ "$path" == "$FRAGMENT_PATH" ]] && return 1
-  case "$base" in
-    10-welcome|15-system|20-update) return 0 ;;
-  esac
-  dpkg-query -S "$path" >/dev/null 2>&1
+disable_motd_news_timer() {
+  local enabled active service_active state_file="$STATE_DIR/motd-news.state"
+  systemctl cat motd-news.timer >/dev/null 2>&1 || return 0
+
+  if [[ ! -e "$state_file" ]]; then
+    enabled=$(systemctl is-enabled motd-news.timer 2>/dev/null || true)
+    active=$(systemctl is-active motd-news.timer 2>/dev/null || true)
+    service_active=$(systemctl is-active motd-news.service 2>/dev/null || true)
+    {
+      printf 'ENABLED=%s\n' "$enabled"
+      printf 'ACTIVE=%s\n' "$active"
+      printf 'SERVICE_ACTIVE=%s\n' "$service_active"
+    } >"$state_file"
+    chmod 0600 "$state_file"
+  fi
+
+  systemctl disable --now motd-news.timer >/dev/null 2>&1 || true
+  systemctl stop motd-news.service >/dev/null 2>&1 || true
+  systemctl reset-failed motd-news.service >/dev/null 2>&1 || true
+  ok "Disabled Ubuntu motd-news; its prior state was recorded for uninstall."
 }
 
-disable_default_fragments() {
-  local path mode already_recorded
+should_disable_fragment() {
+  local path=$1
+  [[ "$path" == "$FRAGMENT_PATH" ]] && return 1
+  return 0
+}
+
+disable_competing_fragments() {
+  local path mode target already_recorded
   install -d -m 0755 /etc/update-motd.d
   touch "$STATE_DIR/disabled-fragments.tsv"
-  chmod 0600 "$STATE_DIR/disabled-fragments.tsv"
+  touch "$STATE_DIR/disabled-symlinks.tsv"
+  chmod 0600 "$STATE_DIR/disabled-fragments.tsv" "$STATE_DIR/disabled-symlinks.tsv"
   for path in /etc/update-motd.d/*; do
-    [[ -e "$path" && -x "$path" ]] || continue
+    [[ -f "$path" && -x "$path" ]] || continue
     should_disable_fragment "$path" || continue
+
+    if [[ -L "$path" ]]; then
+      target=$(readlink "$path")
+      already_recorded=0
+      grep -Fq "${path}"$'\t' "$STATE_DIR/disabled-symlinks.tsv" && already_recorded=1
+      if (( ! already_recorded )); then
+        printf '%s\t%s\n' "$path" "$target" >>"$STATE_DIR/disabled-symlinks.tsv"
+      fi
+      rm -f "$path"
+      ln -s /dev/null "$path"
+      continue
+    fi
+
     already_recorded=0
     grep -Fq "${path}"$'\t' "$STATE_DIR/disabled-fragments.tsv" && already_recorded=1
     if (( ! already_recorded )); then
-      mode=$(stat -c '%a' "$path")
+      mode=$(stat -Lc '%a' "$path")
       printf '%s\t%s\n' "$path" "$mode" >>"$STATE_DIR/disabled-fragments.tsv"
     fi
     chmod a-x "$path"
@@ -1006,8 +1072,9 @@ install_motd() {
   install -d -m 0700 "$STATE_DIR"
   [[ -e "$STATE_DIR/original-motd.type" ]] || first_install=1
   save_original_motd
-  disable_default_fragments
+  disable_motd_news_timer
   disable_legacy_timer
+  disable_competing_fragments
 
   # Suppress the distribution's static MOTD without deleting its saved original.
   suppress_static_motd "$first_install"
