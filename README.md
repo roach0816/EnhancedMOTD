@@ -192,6 +192,8 @@ systemctl status homelab-motd-refresh.service
 
 If the MOTD previews correctly but does not appear during SSH login, confirm that SSH uses PAM and that the host's PAM configuration invokes `pam_motd`/`/etc/update-motd.d`. Debian-family systems normally configure this by default.
 
+If a preview has color but an SSH login does not, upgrade to version 1.0.1 or newer and rerun the installer. Earlier versions could treat PAM's cleaned login environment as a non-color terminal because `TERM` and locale variables are unavailable when Debian generates the dynamic MOTD. As an administrator-controlled fallback, you can also set `COLOR="always"` and `UNICODE="always"` in `/etc/default/homelab-motd`; explicit `never` settings continue to disable those features.
+
 To verify that the fragment is selected by `run-parts`:
 
 ```bash
